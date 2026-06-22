@@ -6,21 +6,32 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/openshift/cluster-etcd-operator/pkg/backuphelpers"
 	"github.com/openshift/cluster-etcd-operator/pkg/tlshelpers"
+	"github.com/openshift/library-go/pkg/controller/factory"
 	"github.com/openshift/library-go/pkg/crypto"
+	"github.com/openshift/library-go/pkg/operator/events"
 	"github.com/openshift/library-go/pkg/operator/v1helpers"
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/util/cert"
+	"k8s.io/client-go/util/workqueue"
+	"k8s.io/utils/clock"
+	"k8s.io/utils/ptr"
 
 	configv1 "github.com/openshift/api/config/v1"
 	operatorv1 "github.com/openshift/api/operator/v1"
+	operatorv1alpha1 "github.com/openshift/api/operator/v1alpha1"
 	configv1listers "github.com/openshift/client-go/config/listers/config/v1"
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/client/v3/mock/mockserver"
@@ -29,6 +40,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/uuid"
@@ -351,6 +363,187 @@ func FakeNetwork(isIPv6 bool) *configv1.Network {
 	}
 }
 
+func FakePVC(namespace, name string) *corev1.PersistentVolumeClaim {
+	return &corev1.PersistentVolumeClaim{
+		ObjectMeta: v1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			VolumeName: "test-volume",
+		},
+	}
+}
+
+func FakeEtcdBackup(name string, configs ...func(backup *operatorv1alpha1.EtcdBackup)) *operatorv1alpha1.EtcdBackup {
+	backup := &operatorv1alpha1.EtcdBackup{
+		ObjectMeta: v1.ObjectMeta{
+			Name:              name,
+			UID:               types.UID(name + "-uid"),
+			CreationTimestamp: v1.Now(),
+			Finalizers:        []string{backuphelpers.FinalizerEtcdBackup},
+		},
+		Spec: operatorv1alpha1.EtcdBackupSpec{
+			Storage: operatorv1alpha1.EtcdBackupStorage{
+				Type: operatorv1alpha1.EtcdBackupStorageTypePVC,
+				PVC: &operatorv1alpha1.EtcdBackupStoragePvc{
+					Name: "test-backup-pvc",
+				},
+			},
+		},
+	}
+	for _, config := range configs {
+		config(backup)
+	}
+	return backup
+}
+
+func WithBackupPolicy(backupPolicyName string) func(backup *operatorv1alpha1.EtcdBackup) {
+	return func(backup *operatorv1alpha1.EtcdBackup) {
+		if backup.Labels == nil {
+			backup.Labels = map[string]string{}
+		}
+		backup.Labels[backuphelpers.LabelEtcdBackupPolicy] = backupPolicyName
+	}
+}
+
+func WithBackupNodeName(nodeName string) func(backup *operatorv1alpha1.EtcdBackup) {
+	return func(backup *operatorv1alpha1.EtcdBackup) {
+		backup.Spec.NodeName = nodeName
+	}
+}
+
+func WithBackupAge(d time.Duration) func(backup *operatorv1alpha1.EtcdBackup) {
+	return func(backup *operatorv1alpha1.EtcdBackup) {
+		backup.CreationTimestamp = v1.Time{Time: time.Now().Add(-d)}
+	}
+}
+
+func WithBackupDeleted() func(backup *operatorv1alpha1.EtcdBackup) {
+	return func(backup *operatorv1alpha1.EtcdBackup) {
+		backup.DeletionTimestamp = ptr.To(v1.Now())
+	}
+}
+
+func WithBackupStorage(storage operatorv1alpha1.EtcdBackupStorage) func(backup *operatorv1alpha1.EtcdBackup) {
+	return func(backup *operatorv1alpha1.EtcdBackup) {
+		backup.Spec.Storage = storage
+	}
+}
+
+func WithBackupStatus(status operatorv1alpha1.EtcdBackupStatus) func(backup *operatorv1alpha1.EtcdBackup) {
+	return func(backup *operatorv1alpha1.EtcdBackup) {
+		backup.Status = status
+	}
+}
+
+func WithBackupCompleted() func(backup *operatorv1alpha1.EtcdBackup) {
+	return func(backup *operatorv1alpha1.EtcdBackup) {
+		backup.Status.Conditions = append(backup.Status.Conditions, v1.Condition{
+			Type:   string(operatorv1alpha1.BackupCompleted),
+			Status: v1.ConditionTrue,
+		})
+		if backup.Status.Files == nil {
+			dir := ""
+			switch backup.Spec.Storage.Type {
+			case operatorv1alpha1.EtcdBackupStorageTypeLocal:
+				dir = backup.Spec.Storage.Local.HostPath
+			case operatorv1alpha1.EtcdBackupStorageTypePVC:
+				dir = backup.Spec.Storage.PVC.Path
+			}
+			backup.Status.Files = append(backup.Status.Files, operatorv1alpha1.EtcdBackupFile{
+				Path: path.Join(dir, backup.Name, "snapshot.db"),
+				Size: *resource.NewQuantity(100000, resource.BinarySI),
+			}, operatorv1alpha1.EtcdBackupFile{
+				Path: path.Join(dir, backup.Name, "archive.tar.gz"),
+				Size: *resource.NewQuantity(100, resource.BinarySI),
+			})
+		}
+		if backup.Status.NodeName == "" {
+			if backup.Spec.NodeName == "" {
+				backup.Status.NodeName = "test-node"
+			} else {
+				backup.Status.NodeName = backup.Spec.NodeName
+			}
+		}
+	}
+}
+
+func WithBackupFailed() func(backup *operatorv1alpha1.EtcdBackup) {
+	return func(backup *operatorv1alpha1.EtcdBackup) {
+		backup.Status.Conditions = append(backup.Status.Conditions, v1.Condition{
+			Type:   string(operatorv1alpha1.BackupFailed),
+			Status: v1.ConditionTrue,
+		})
+		if backup.Status.Files != nil {
+			backup.Status.Files = nil
+		}
+		if backup.Status.NodeName == "" {
+			backup.Status.NodeName = "test-node"
+		}
+	}
+}
+
+func FakeEtcdBackupPolicy(name, schedule string, configs ...func(backup *operatorv1alpha1.EtcdBackupPolicy)) *operatorv1alpha1.EtcdBackupPolicy {
+	backupPolicy := &operatorv1alpha1.EtcdBackupPolicy{
+		ObjectMeta: v1.ObjectMeta{
+			Name:              name,
+			UID:               types.UID(name + "-uid"),
+			CreationTimestamp: v1.Now(),
+		},
+		Spec: operatorv1alpha1.EtcdBackupPolicySpec{
+			Schedule: schedule,
+			Storage: operatorv1alpha1.EtcdBackupStorage{
+				Type: operatorv1alpha1.EtcdBackupStorageTypePVC,
+				PVC: &operatorv1alpha1.EtcdBackupStoragePvc{
+					Name: "test-backup-pvc",
+				},
+			},
+			FailedBackupsHistoryLimit: 1,
+		},
+	}
+	for _, config := range configs {
+		config(backupPolicy)
+	}
+	return backupPolicy
+}
+
+func WithBackupPolicyAge(age time.Duration) func(backupPolicy *operatorv1alpha1.EtcdBackupPolicy) {
+	return func(backupPolicy *operatorv1alpha1.EtcdBackupPolicy) {
+		backupPolicy.CreationTimestamp = v1.Time{Time: time.Now().Add(-age)}
+	}
+}
+
+func WithBackupPolicyDeleted() func(backupPolicy *operatorv1alpha1.EtcdBackupPolicy) {
+	return func(backupPolicy *operatorv1alpha1.EtcdBackupPolicy) {
+		backupPolicy.DeletionTimestamp = ptr.To(v1.Now())
+	}
+}
+
+func WithBackupPolicyTimeZone(timeZone string) func(backupPolicy *operatorv1alpha1.EtcdBackupPolicy) {
+	return func(backupPolicy *operatorv1alpha1.EtcdBackupPolicy) {
+		backupPolicy.Spec.TimeZone = timeZone
+	}
+}
+
+func WithBackupPolicyStorage(storage operatorv1alpha1.EtcdBackupStorage) func(backupPolicy *operatorv1alpha1.EtcdBackupPolicy) {
+	return func(backupPolicy *operatorv1alpha1.EtcdBackupPolicy) {
+		backupPolicy.Spec.Storage = storage
+	}
+}
+
+func WithBackupPolicyRetentionRules(rules ...operatorv1alpha1.EtcdBackupPolicyRetentionRule) func(backupPolicy *operatorv1alpha1.EtcdBackupPolicy) {
+	return func(backupPolicy *operatorv1alpha1.EtcdBackupPolicy) {
+		backupPolicy.Spec.RetentionRules = rules
+	}
+}
+
+func WithBackupPolicyStatus(status operatorv1alpha1.EtcdBackupPolicyStatus) func(backupPolicy *operatorv1alpha1.EtcdBackupPolicy) {
+	return func(backupPolicy *operatorv1alpha1.EtcdBackupPolicy) {
+		backupPolicy.Status = status
+	}
+}
+
 type FakePodLister struct {
 	PodList []*corev1.Pod
 }
@@ -584,4 +777,42 @@ func FakeStaticPodOperatorClient(t *testing.T, conditions []operatorv1.OperatorC
 		nil,
 		nil,
 	)
+}
+
+type fakeSyncContext struct {
+	key      string
+	recorder events.Recorder
+	queue    workqueue.RateLimitingInterface
+}
+
+func (f *fakeSyncContext) Queue() workqueue.RateLimitingInterface { return f.queue }
+func (f *fakeSyncContext) QueueKey() string                       { return f.key }
+func (f *fakeSyncContext) Recorder() events.Recorder              { return f.recorder }
+
+func FakeSyncContext(t *testing.T, key string) factory.SyncContext {
+	return FakeSyncContextWithOpts(t, key, nil, nil)
+}
+
+func FakeSyncContextWithOpts(t *testing.T, key string, queue workqueue.RateLimitingInterface, recorder events.Recorder) factory.SyncContext {
+	t.Helper()
+	if queue == nil {
+		queue = workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[any]())
+		t.Cleanup(queue.ShutDown)
+	}
+	if recorder == nil {
+		recorder = events.NewInMemoryRecorder("test", clock.RealClock{})
+		t.Cleanup(recorder.Shutdown)
+	}
+	return &fakeSyncContext{
+		key:      key,
+		recorder: recorder,
+		queue:    queue,
+	}
+}
+
+func AppendRuntimeObjects[T runtime.Object](runtimeObjs []runtime.Object, objs []T) []runtime.Object {
+	for _, obj := range objs {
+		runtimeObjs = append(runtimeObjs, obj)
+	}
+	return runtimeObjs
 }
