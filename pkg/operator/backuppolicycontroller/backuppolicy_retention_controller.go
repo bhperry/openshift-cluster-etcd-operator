@@ -59,6 +59,7 @@ func NewBackupPolicyRetentionController(
 					return []string{backupPolicy.Name}
 				}
 				if backup, ok := o.(*operatorv1alpha1.EtcdBackup); ok && backup.Labels != nil {
+					// Only trigget sync on backups owned by an EtcdBackupPolicy when they are not deleted and have completed or failed
 					backupPolicyName := backup.Labels[backuphelpers.LabelEtcdBackupPolicy]
 					if backupPolicyName != "" && backup.DeletionTimestamp == nil && backuphelpers.IsBackupFinished(backup) {
 						return []string{backupPolicyName}

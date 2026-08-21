@@ -96,8 +96,12 @@ func NewBackupGarbageCollectionController(
 				return backup.DeletionTimestamp != nil && slices.Contains(backup.Finalizers, backuphelpers.FinalizerEtcdBackup)
 			}
 			if job, ok := o.(*batchv1.Job); ok {
-				// Only need to trigger sync on jobs when it is completed or failed
-				return job.Namespace == operatorclient.TargetNamespace && job.Labels != nil && job.Labels["app"] == backupGCAppName && isJobFinished(job)
+				// Only trigger sync on GC jobs when they have finalizer and are completed or failed
+				return job.Namespace == operatorclient.TargetNamespace &&
+					job.Labels != nil &&
+					job.Labels["app"] == backupGCAppName &&
+					slices.Contains(job.Finalizers, backuphelpers.FinalizerEtcdBackup) &&
+					isJobFinished(job)
 			}
 			return false
 		}, backupInformer, jobInformer).

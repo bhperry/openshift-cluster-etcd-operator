@@ -4522,6 +4522,7 @@ var schemaYAML = typed.YAMLObject(`types:
     - name: failedBackupsHistoryLimit
       type:
         scalar: numeric
+      default: 0
     - name: nodeCount
       type:
         scalar: numeric
@@ -4550,15 +4551,26 @@ var schemaYAML = typed.YAMLObject(`types:
 - name: com.github.openshift.api.operator.v1alpha1.EtcdBackupPolicyStatus
   map:
     fields:
-    - name: lastScheduleNodes
+    - name: active
       type:
         list:
           elementType:
-            scalar: string
+            namedType: com.github.openshift.api.operator.v1alpha1.EtcdBackupReference
           elementRelationship: atomic
     - name: lastScheduleTime
       type:
         namedType: io.k8s.apimachinery.pkg.apis.meta.v1.Time
+- name: com.github.openshift.api.operator.v1alpha1.EtcdBackupReference
+  map:
+    fields:
+    - name: name
+      type:
+        scalar: string
+      default: ""
+    - name: uid
+      type:
+        scalar: string
+      default: ""
 - name: com.github.openshift.api.operator.v1alpha1.EtcdBackupSpec
   map:
     fields:

@@ -126,6 +126,11 @@ func (in EtcdBackupPolicyStatus) OpenAPIModelName() string {
 }
 
 // OpenAPIModelName returns the OpenAPI model name for this type.
+func (in EtcdBackupReference) OpenAPIModelName() string {
+	return "com.github.openshift.api.operator.v1alpha1.EtcdBackupReference"
+}
+
+// OpenAPIModelName returns the OpenAPI model name for this type.
 func (in EtcdBackupSpec) OpenAPIModelName() string {
 	return "com.github.openshift.api.operator.v1alpha1.EtcdBackupSpec"
 }

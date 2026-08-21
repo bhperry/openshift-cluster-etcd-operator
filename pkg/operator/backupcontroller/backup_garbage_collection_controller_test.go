@@ -37,23 +37,16 @@ type testCaseBackupGarbageCollectionController struct {
 
 func runBackupGarbageCollectionControllerTest(t *testing.T, tc testCaseBackupGarbageCollectionController) {
 	t.Helper()
-	backups := make([]runtime.Object, 0, len(tc.backups))
-	for _, backup := range tc.backups {
-		backups = append(backups, backup)
-	}
+	operatorObjs := make([]runtime.Object, 0, len(tc.backups))
+	operatorObjs = testutils.AppendRuntimeObjects(operatorObjs, tc.backups)
+
 	k8sObjs := make([]runtime.Object, 0, len(tc.jobs)+len(tc.nodes)+len(tc.pvcs))
-	for _, job := range tc.jobs {
-		k8sObjs = append(k8sObjs, job)
-	}
-	for _, node := range tc.nodes {
-		k8sObjs = append(k8sObjs, node)
-	}
-	for _, pvc := range tc.pvcs {
-		k8sObjs = append(k8sObjs, pvc)
-	}
+	k8sObjs = testutils.AppendRuntimeObjects(k8sObjs, tc.jobs)
+	k8sObjs = testutils.AppendRuntimeObjects(k8sObjs, tc.nodes)
+	k8sObjs = testutils.AppendRuntimeObjects(k8sObjs, tc.pvcs)
 
 	client := k8sfakeclient.NewSimpleClientset(k8sObjs...)
-	operatorFake := fake.NewSimpleClientset(backups...)
+	operatorFake := fake.NewSimpleClientset(operatorObjs...)
 
 	sharedFactory := informers.NewSharedInformerFactory(client, 0)
 	operatorSharedFactory := operatorinformers.NewSharedInformerFactory(operatorFake, 0)
@@ -186,10 +179,14 @@ func TestBackupGarbageCollectionExistingJob(t *testing.T) {
 
 func TestBackupGarbageCollectionNewAndExistingJob(t *testing.T) {
 	// Create a new GC Job for the newly deleted EtcdBackup, but not for the one with an existing GC Job
+	storage := operatorv1alpha1.EtcdBackupStorage{
+		Type: operatorv1alpha1.EtcdBackupStorageTypePVC,
+		PVC:  &operatorv1alpha1.EtcdBackupStoragePvc{Name: "test-backup-pvc"},
+	}
 	runBackupGarbageCollectionControllerTest(t, testCaseBackupGarbageCollectionController{
 		backups: []*operatorv1alpha1.EtcdBackup{
-			testutils.FakeEtcdBackup("test-backup-1", testutils.WithBackupCompleted(), testutils.WithBackupDeleted()),
-			testutils.FakeEtcdBackup("test-backup-2", testutils.WithBackupCompleted(), testutils.WithBackupDeleted()),
+			testutils.FakeEtcdBackup("test-backup-1", testutils.WithBackupCompleted(), testutils.WithBackupDeleted(), testutils.WithBackupStorage(storage)),
+			testutils.FakeEtcdBackup("test-backup-2", testutils.WithBackupCompleted(), testutils.WithBackupDeleted(), testutils.WithBackupStorage(storage)),
 		},
 		pvcs: []*corev1.PersistentVolumeClaim{testutils.FakePVC(operatorclient.TargetNamespace, "test-backup-pvc")},
 		jobs: []*batchv1.Job{{
@@ -263,11 +260,17 @@ func TestBackupGarbageCollectionFinalizeOnMissingStorageBackend(t *testing.T) {
 }
 
 func TestBackupGarbageCollectionMultipleBackupsPerJob(t *testing.T) {
-	// Combine muliple deleted EtcdBackups on the same storage backend into one GC Job
+	// Combine muliple deleted EtcdBackups on the same sharedStorage backend into one GC Job
+	sharedStorage := operatorv1alpha1.EtcdBackupStorage{
+		Type: operatorv1alpha1.EtcdBackupStorageTypePVC,
+		PVC: &operatorv1alpha1.EtcdBackupStoragePvc{
+			Name: "test-backup-pvc",
+		},
+	}
 	runBackupGarbageCollectionControllerTest(t, testCaseBackupGarbageCollectionController{
 		backups: []*operatorv1alpha1.EtcdBackup{
-			testutils.FakeEtcdBackup("test-backup-1", testutils.WithBackupCompleted(), testutils.WithBackupDeleted()),
-			testutils.FakeEtcdBackup("test-backup-2", testutils.WithBackupCompleted(), testutils.WithBackupDeleted()),
+			testutils.FakeEtcdBackup("test-backup-1", testutils.WithBackupCompleted(), testutils.WithBackupDeleted(), testutils.WithBackupStorage(sharedStorage)),
+			testutils.FakeEtcdBackup("test-backup-2", testutils.WithBackupCompleted(), testutils.WithBackupDeleted(), testutils.WithBackupStorage(sharedStorage)),
 			testutils.FakeEtcdBackup("test-backup-3", testutils.WithBackupCompleted(), testutils.WithBackupDeleted(),
 				testutils.WithBackupStorage(operatorv1alpha1.EtcdBackupStorage{
 					Type: operatorv1alpha1.EtcdBackupStorageTypePVC,

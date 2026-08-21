@@ -45,6 +45,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	corev1listers "k8s.io/client-go/listers/core/v1"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 
 	"github.com/openshift/cluster-etcd-operator/pkg/dnshelpers"
@@ -386,9 +387,7 @@ func FakeEtcdBackup(name string, configs ...func(backup *operatorv1alpha1.EtcdBa
 		Spec: operatorv1alpha1.EtcdBackupSpec{
 			Storage: operatorv1alpha1.EtcdBackupStorage{
 				Type: operatorv1alpha1.EtcdBackupStorageTypePVC,
-				PVC: &operatorv1alpha1.EtcdBackupStoragePvc{
-					Name: "test-backup-pvc",
-				},
+				PVC:  &operatorv1alpha1.EtcdBackupStoragePvc{Name: name + "-pvc"},
 			},
 		},
 	}
@@ -495,9 +494,7 @@ func FakeEtcdBackupPolicy(name, schedule string, configs ...func(backup *operato
 			Schedule: schedule,
 			Storage: operatorv1alpha1.EtcdBackupStorage{
 				Type: operatorv1alpha1.EtcdBackupStorageTypePVC,
-				PVC: &operatorv1alpha1.EtcdBackupStoragePvc{
-					Name: "test-backup-pvc",
-				},
+				PVC:  &operatorv1alpha1.EtcdBackupStoragePvc{Name: name + "-pvc"},
 			},
 			FailedBackupsHistoryLimit: 1,
 		},
@@ -815,4 +812,44 @@ func AppendRuntimeObjects[T runtime.Object](runtimeObjs []runtime.Object, objs [
 		runtimeObjs = append(runtimeObjs, obj)
 	}
 	return runtimeObjs
+}
+
+func GetStatusAction[T k8stesting.Action](actions []k8stesting.Action, filters ...func(a T) bool) (T, bool) {
+	filters = append(filters, func(a T) bool { return a.GetSubresource() == "status" })
+	return GetAction(actions, filters...)
+}
+
+func GetAction[T k8stesting.Action](actions []k8stesting.Action, filters ...func(a T) bool) (T, bool) {
+	for _, action := range actions {
+		if a, ok := action.(T); ok {
+			for _, f := range filters {
+				if !f(a) {
+					continue
+				}
+			}
+			return a, true
+		}
+	}
+	var zero T
+	return zero, false
+}
+
+func ListStatusActions[T k8stesting.Action](actions []k8stesting.Action, filters ...func(a T) bool) []T {
+	filters = append(filters, func(a T) bool { return a.GetSubresource() == "status" })
+	return ListActions(actions, filters...)
+}
+
+func ListActions[T k8stesting.Action](actions []k8stesting.Action, filters ...func(a T) bool) []T {
+	var typedActions []T
+	for _, action := range actions {
+		if a, ok := action.(T); ok {
+			for _, f := range filters {
+				if !f(a) {
+					continue
+				}
+			}
+			typedActions = append(typedActions, a)
+		}
+	}
+	return typedActions
 }

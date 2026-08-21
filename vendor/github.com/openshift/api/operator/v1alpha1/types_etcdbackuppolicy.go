@@ -50,6 +50,7 @@ type EtcdBackupPolicySpec struct {
 
 	// nodeSelector specifies which master node(s) to run backup jobs on.
 	// If no selector is specified, the default node-role.kubernetes.io/master label will be used.
+	// If no nodes are matched, then no backups will run.
 	// +kubebuilder:validation:Optional
 	// +optional
 	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
@@ -68,18 +69,21 @@ type EtcdBackupPolicySpec struct {
 	Storage EtcdBackupStorage `json:"storage"`
 
 	// retentionRules defines the policy for retaining and deleting existing backups.
-	// Backups are deleted from the oldest first until all rules are satisfied (logical OR).
+	// Backups are deleted from the oldest first until all rules are satisfied.
 	// If no rules are specified then backups created by this policy will not be automatically deleted.
 	// +kubebuilder:validation:Optional
 	// +optional
 	RetentionRules []EtcdBackupPolicyRetentionRule `json:"retentionRules,omitzero"`
 
 	// failedBackupsHistoryLimit defined the number of failed etcdbackups to retain. Value must be non-negative integer. Defaults to 1.
+	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Default=1
-	FailedBackupsHistoryLimit int `json:"failedBackupsHistoryLimit,omitempty"`
+	FailedBackupsHistoryLimit int `json:"failedBackupsHistoryLimit"`
 }
 
 // +union
+// +kubebuilder:validation:XValidation:rule="(self.type == 'MaxQuantity') ? has(self.maxQuantity) : !has(self.maxQuantity)",message="maxQuantity is required when type is MaxQuantity, and forbidden otherwise"
+// +kubebuilder:validation:XValidation:rule="(self.type == 'MaxSize') ? has(self.maxSize) : !has(self.maxSize)",message="maxSize is required when type is MaxSize, and forbidden otherwise"
 type EtcdBackupPolicyRetentionRule struct {
 	// type defined which rule field is set
 	// +unionDiscriminator
@@ -109,17 +113,28 @@ const (
 )
 
 type EtcdBackupPolicyStatus struct {
+	// active is a list of references to in progress backups controlled by this policy
+	// +kubebuilder:validation:Optional
+	// +optional
+	Active []EtcdBackupReference `json:"active,omitempty"`
+
 	// lastScheduleTime is the time when the last scheduled backup was triggered.
 	// This is used by the controller to track when backups have been executed
 	// and to prevent duplicate executions on controller restart.
 	// +kubebuilder:validation:Optional
 	// +optional
 	LastScheduleTime *metav1.Time `json:"lastScheduleTime,omitempty"`
+}
 
-	// lastScheduleNodes is the name of nodes selected during the last scheduled execution.
-	// +kubebuilder:validation:Optional
-	// +optional
-	LastScheduleNodes []string `json:"lastScheduleNodes,omitempty"`
+type EtcdBackupReference struct {
+	// name of the backup
+	// +kubebuilder:validation:Required
+	// +required
+	Name string `json:"name"`
+	// uid of the backup
+	// +kubebuilder:validation:Required
+	// +required
+	UID string `json:"uid"`
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object

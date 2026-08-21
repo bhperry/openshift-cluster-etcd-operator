@@ -18,7 +18,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/utils/ptr"
 
 	operatorv1alpha1 "github.com/openshift/api/operator/v1alpha1"
@@ -95,7 +94,12 @@ func NewBackupController(
 				return !backuphelpers.IsBackupFinished(backup)
 			}
 			if job, ok := obj.(*batchv1.Job); ok {
-				return job.Labels["state"] != "processed"
+				// Only trigger sync on backup jobs when they have finalizer and are completed or failed
+				return job.Namespace == operatorclient.TargetNamespace &&
+					job.Labels != nil &&
+					job.Labels["app"] == backupAppName &&
+					slices.Contains(job.Finalizers, backuphelpers.FinalizerEtcdBackup) &&
+					isJobFinished(job)
 			}
 			return false
 		}, backupInformer, jobInformer).
@@ -112,13 +116,7 @@ func (c *BackupController) sync(ctx context.Context, _ factory.SyncContext) erro
 		return nil
 	}
 
-	selector := labels.SelectorFromSet(labels.Set{"app": backupAppName})
-	req, err := labels.NewRequirement("state", selection.NotEquals, []string{"processed"})
-	if err != nil {
-		return fmt.Errorf("BackupController invalid label selector: %w", err)
-	}
-	selector = selector.Add(*req)
-	jobs, err := c.jobsLister.List(selector)
+	jobs, err := c.jobsLister.List(labels.SelectorFromSet(labels.Set{"app": backupAppName}))
 	if err != nil {
 		return fmt.Errorf("BackupController could not list backup jobs, error was: %w", err)
 	}
@@ -139,23 +137,11 @@ func (c *BackupController) sync(ctx context.Context, _ factory.SyncContext) erro
 			if err != nil {
 				return fmt.Errorf("BackupController could not reconcile job status: %w", err)
 			}
-
-			delete(jobIndexed, backup.Name)
 			continue
 		}
 
 		if backup.DeletionTimestamp == nil && backup.Status.Job == nil {
 			backupsToRun = append(backupsToRun, backup)
-		}
-	}
-
-	if len(jobIndexed) > 0 {
-		klog.V(4).Infof("BackupController found dangling jobs without corresponding backup, removing")
-		for _, job := range jobIndexed {
-			err := jobsClient.Delete(ctx, job.Name, v1.DeleteOptions{PropagationPolicy: ptr.To(v1.DeletePropagationBackground)})
-			if err != nil {
-				return fmt.Errorf("BackupController could not delete danging job [%s]: %w", job.Name, err)
-			}
 		}
 	}
 
@@ -199,7 +185,7 @@ func validateBackup(ctx context.Context,
 			if errors.IsNotFound(err) {
 				markFailedErr := markBackupFailed(ctx, backupsClient, backup, fmt.Sprintf("unable to find PVC [%s]", backup.Spec.Storage.PVC.Name))
 				if markFailedErr != nil {
-					return false, fmt.Errorf("BackupController PVC %s not found: failed to mark as failed: %w", backup.Spec.Storage.PVC.Name, markFailedErr)
+					return false, fmt.Errorf("BackupController unable to mark backup [%s] with missing PVC as failed: %w", backup.Name, markFailedErr)
 				}
 
 				return false, nil
@@ -235,14 +221,12 @@ func markBackupFailed(ctx context.Context,
 
 func indexJobsByBackupLabelName(jobs []*batchv1.Job) map[string]*batchv1.Job {
 	m := map[string]*batchv1.Job{}
-	if jobs == nil {
-		return m
-	}
-
 	for _, j := range jobs {
-		backupCrdName := j.Labels[backupNameLabel]
-		if backupCrdName != "" {
-			m[backupCrdName] = j
+		if slices.Contains(j.Finalizers, backuphelpers.FinalizerEtcdBackup) && j.Labels != nil {
+			backupCrdName := j.Labels[backupNameLabel]
+			if backupCrdName != "" {
+				m[backupCrdName] = j
+			}
 		}
 	}
 
@@ -307,31 +291,23 @@ func reconcileJobStatus(ctx context.Context,
 		}
 
 		if jobState == batchv1.JobComplete {
-			// TODO(bhperry): What happens if pod not found? Should we retry for a few syncs in case pod cache just hasn't caught up yet?
-			pods, err := podLister.List(labels.SelectorFromSet(labels.Set{"batch.kubernetes.io/job-name": job.Name}))
-			if err != nil {
-				return err
-			}
-			for _, pod := range pods {
-				if pod.Status.Phase == corev1.PodSucceeded && len(pod.Status.ContainerStatuses) > 0 && pod.Status.ContainerStatuses[0].State.Terminated != nil {
-					terminationMessage := pod.Status.ContainerStatuses[0].State.Terminated.Message
-					if terminationMessage != "" {
-						data := backuphelpers.BackupTerminationLog{}
-						if err := json.Unmarshal([]byte(terminationMessage), &data); err != nil {
-							klog.V(4).Infof("error reading termination log: %s", err)
-						} else {
-							backup.Status.Files = make([]operatorv1alpha1.EtcdBackupFile, len(data.Files))
-							for i, file := range data.Files {
-								filePath, _ := strings.CutPrefix(file.Path, backupPathMount)
-								backup.Status.Files[i] = operatorv1alpha1.EtcdBackupFile{
-									Path: filePath,
-									Size: file.Size,
-								}
-							}
-						}
-					}
-					break
+			// TODO(bhperry): If pod is not found, backup will be marked completed but won't have status.files info.
+			// 		In this case we can still GC, it just won't count towards total size with MaxSize rule.
+			//		Backup directory can be inferred based on backup name and storage path.
+			// 		Node should be selected BEFORE running job to ensure this is possible (should do this anyway to pick a healthy etcd member)
+			if pod, err := findCompletedBackupPod(podLister, job.Name); err != nil {
+				return fmt.Errorf("error listing pods for backup job [%s]: %w", job.Name, err)
+			} else if pod != nil {
+				var terminationMessage string
+				if len(pod.Status.ContainerStatuses) > 0 {
+					terminationMessage = pod.Status.ContainerStatuses[0].State.Terminated.Message
 				}
+				if files, err := parseTerminationMessage(terminationMessage); err != nil {
+					klog.Infof("BackupController error reading termination message for backup [%s]: %v", backup.Name, err)
+				} else {
+					backup.Status.Files = files
+				}
+				backup.Status.NodeName = pod.Spec.NodeName
 			}
 		}
 
@@ -345,7 +321,6 @@ func reconcileJobStatus(ctx context.Context,
 	if job.Labels == nil {
 		job.Labels = map[string]string{}
 	}
-	job.Labels["state"] = "processed"
 	job.Finalizers = slices.DeleteFunc(job.Finalizers, func(finalizer string) bool { return finalizer == backuphelpers.FinalizerEtcdBackup })
 	if _, err := jobClient.Update(ctx, job, v1.UpdateOptions{}); err != nil {
 		return fmt.Errorf("error while updating job labels [%s]: %w", job.Name, err)
@@ -382,7 +357,7 @@ func createBackupJob(ctx context.Context,
 		return fmt.Errorf("BackupController could not decode batchv1 job scheme: %w", err)
 	}
 
-	jobName := generateBackupJobName(backup)
+	jobName := backup.Name
 	job := obj.(*batchv1.Job)
 	job.Name = jobName
 	job.Labels[backupNameLabel] = backup.Name
@@ -393,13 +368,6 @@ func createBackupJob(ctx context.Context,
 		UID:        backup.UID,
 	})
 	job.Finalizers = append(job.Finalizers, backuphelpers.FinalizerEtcdBackup)
-
-	// TODO(bhperry): Maybe just owner ref to EtcdBackup? Would need a garbage collector to handle since EtcdBackup is cluster scoped.
-	// we also inject owner references from periodic backups
-	for _, r := range backup.OwnerReferences {
-		job.OwnerReferences = append(job.OwnerReferences, r)
-	}
-
 	job.Spec.TTLSecondsAfterFinished = ptr.To(ttlSecondsAfterFinished)
 	job.Spec.Template.Spec.InitContainers[0].Image = operatorImagePullSpec
 	job.Spec.Template.Spec.Containers[0].Image = operatorImagePullSpec
@@ -480,7 +448,41 @@ func createBackupJob(ctx context.Context,
 	return nil
 }
 
+func findCompletedBackupPod(podLister corev1listers.PodNamespaceLister, jobName string) (*corev1.Pod, error) {
+	pods, err := podLister.List(labels.SelectorFromSet(labels.Set{"batch.kubernetes.io/job-name": jobName}))
+	if err != nil {
+		return nil, err
+	}
+	for _, pod := range pods {
+		if pod.Status.Phase == corev1.PodSucceeded && len(pod.Status.ContainerStatuses) > 0 && pod.Status.ContainerStatuses[0].State.Terminated != nil {
+			return pod, nil
+		}
+	}
+	return nil, nil
+}
+
+func parseTerminationMessage(message string) ([]operatorv1alpha1.EtcdBackupFile, error) {
+	if message == "" {
+		return nil, fmt.Errorf("missing termination message")
+	}
+	data := backuphelpers.BackupTerminationLog{}
+	if err := json.Unmarshal([]byte(message), &data); err != nil {
+		return nil, fmt.Errorf("error reading termination message: %w", err)
+	}
+
+	files := make([]operatorv1alpha1.EtcdBackupFile, len(data.Files))
+	for i, file := range data.Files {
+		filePath, _ := strings.CutPrefix(file.Path, backupPathMount)
+		files[i] = operatorv1alpha1.EtcdBackupFile{
+			Path: filePath,
+			Size: file.Size,
+		}
+	}
+	return files, nil
+}
+
 // generateBackupJobName creates a hash-based name for deduplication
+// TODO: Delete if not needed
 func generateBackupJobName(backup *operatorv1alpha1.EtcdBackup) string {
 	prefix := "backup-"
 	name := backup.Name

@@ -382,10 +382,10 @@ func (EtcdBackupPolicyRetentionRule) SwaggerDoc() map[string]string {
 var map_EtcdBackupPolicySpec = map[string]string{
 	"schedule":                  "schedule sets the backup schedule in Cron format, see https://en.wikipedia.org/wiki/Cron.",
 	"timeZone":                  "timeZone name for the given schedule, see https://en.wikipedia.org/wiki/List_of_tz_database_time_zones. If not specified, this will default to the time zone of the cluster-etcd-operator process.",
-	"nodeSelector":              "nodeSelector specifies which master node(s) to run backup jobs on. If no selector is specified, the default node-role.kubernetes.io/master label will be used.",
+	"nodeSelector":              "nodeSelector specifies which master node(s) to run backup jobs on. If no selector is specified, the default node-role.kubernetes.io/master label will be used. If no nodes are matched, then no backups will run.",
 	"nodeCount":                 "nodeCount sets the maximum number of nodes to run backups on when multiple are selected. If a value greater than zero is set, nodes are selected in lexicographical order. Values less than or equal to zero will select all available nodes.",
 	"storage":                   "storage specifies the location where etcd backup files will be saved.",
-	"retentionRules":            "retentionRules defines the policy for retaining and deleting existing backups. Backups are deleted from the oldest first until all rules are satisfied (logical OR). If no rules are specified then backups created by this policy will not be automatically deleted.",
+	"retentionRules":            "retentionRules defines the policy for retaining and deleting existing backups. Backups are deleted from the oldest first until all rules are satisfied. If no rules are specified then backups created by this policy will not be automatically deleted.",
 	"failedBackupsHistoryLimit": "failedBackupsHistoryLimit defined the number of failed etcdbackups to retain. Value must be non-negative integer. Defaults to 1.",
 }
 
@@ -394,12 +394,21 @@ func (EtcdBackupPolicySpec) SwaggerDoc() map[string]string {
 }
 
 var map_EtcdBackupPolicyStatus = map[string]string{
-	"lastScheduleTime":  "lastScheduleTime is the time when the last scheduled backup was triggered. This is used by the controller to track when backups have been executed and to prevent duplicate executions on controller restart.",
-	"lastScheduleNodes": "lastScheduleNodes is the name of nodes selected during the last scheduled execution.",
+	"active":           "active is a list of references to in progress backups controlled by this policy",
+	"lastScheduleTime": "lastScheduleTime is the time when the last scheduled backup was triggered. This is used by the controller to track when backups have been executed and to prevent duplicate executions on controller restart.",
 }
 
 func (EtcdBackupPolicyStatus) SwaggerDoc() map[string]string {
 	return map_EtcdBackupPolicyStatus
+}
+
+var map_EtcdBackupReference = map[string]string{
+	"name": "name of the backup",
+	"uid":  "uid of the backup",
+}
+
+func (EtcdBackupReference) SwaggerDoc() map[string]string {
+	return map_EtcdBackupReference
 }
 
 var map_ImageContentSourcePolicy = map[string]string{

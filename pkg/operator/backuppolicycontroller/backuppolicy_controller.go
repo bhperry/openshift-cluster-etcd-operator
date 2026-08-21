@@ -3,12 +3,14 @@ package backuppolicycontroller
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/robfig/cron/v3"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/apiserver/pkg/storage/names"
 
 	operatorv1 "github.com/openshift/api/operator/v1"
 	operatorv1alpha1 "github.com/openshift/api/operator/v1alpha1"
@@ -21,13 +23,16 @@ import (
 	"github.com/openshift/library-go/pkg/operator/events"
 	"github.com/openshift/library-go/pkg/operator/v1helpers"
 
-	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
+)
+
+const (
+	maxNameLength = 63
 )
 
 type BackupPolicyController struct {
@@ -75,12 +80,18 @@ func NewBackupPolicyController(
 				if backupPolicy, ok := o.(*operatorv1alpha1.EtcdBackupPolicy); ok {
 					return []string{backupPolicy.Name}
 				}
+				if backup, ok := o.(*operatorv1alpha1.EtcdBackup); ok {
+					// Only trigger sync from backups when they are completed or failed
+					if backupPolicyName := backup.Labels[backuphelpers.LabelEtcdBackupPolicy]; backupPolicyName != "" && backuphelpers.IsBackupFinished(backup) {
+						return []string{backupPolicyName}
+					}
+				}
 				return nil
 			},
 			etcdBackupPolicyInformer,
+			etcdBackupInformer,
 		).
 		WithBareInformers(
-			etcdBackupInformer,
 			nodeInformer,
 		).
 		WithSync(syncer.Sync).
@@ -122,20 +133,26 @@ func (c *BackupPolicyController) sync(ctx context.Context, syncCtx factory.SyncC
 		return nil
 	}
 
+	if len(backupPolicy.Status.Active) > 0 {
+		backupPolicy, err = c.syncActive(ctx, backupPolicy)
+		if err != nil {
+			return err
+		} else if len(backupPolicy.Status.Active) > 0 {
+			return nil
+		}
+	}
+
 	schedule, err := c.parseSchedule(backupPolicy)
 	if err != nil {
 		return fmt.Errorf("BackupPolicyController failed to parse %s schedule: %w", backupPolicyName, err)
 	}
-
-	var lastScheduleTime time.Time
-	if backupPolicy.Status.LastScheduleTime != nil {
-		lastScheduleTime = backupPolicy.Status.LastScheduleTime.Time
-	} else {
-		lastScheduleTime = backupPolicy.CreationTimestamp.Time
+	scheduleTime, err := nextScheduleTime(backupPolicy, time.Now(), schedule)
+	if err != nil {
+		return fmt.Errorf("BackupPolicyController failed to calculate next schedule time for EtcdBackupPolicy %s: %w", backupPolicy.Name, err)
 	}
-	nextTime := schedule.Next(lastScheduleTime)
-	if time.Now().After(nextTime) && !c.hasActiveBackup(ctx, backupPolicy) {
-		if err := c.executeBackup(ctx, backupPolicy); err != nil {
+
+	if scheduleTime != nil {
+		if err := c.executeBackup(ctx, backupPolicy, *scheduleTime); err != nil {
 			return fmt.Errorf("BackupPolicyController failed to execute backup for EtcdBackupPolicy %s: %w", backupPolicy.Name, err)
 		}
 	}
@@ -156,7 +173,7 @@ func (c *BackupPolicyController) parseSchedule(backupPolicy *operatorv1alpha1.Et
 
 func (c *BackupPolicyController) hasActiveBackup(ctx context.Context, backupPolicy *operatorv1alpha1.EtcdBackupPolicy) bool {
 	// Live API call to ensure no EtcdBackups are missed
-	backups, err := c.operatorClient.EtcdBackups().List(ctx, v1.ListOptions{
+	backupList, err := c.operatorClient.EtcdBackups().List(ctx, v1.ListOptions{
 		LabelSelector: backuphelpers.LabelEtcdBackupPolicy + "=" + backupPolicy.Name,
 	})
 	if err != nil {
@@ -164,9 +181,8 @@ func (c *BackupPolicyController) hasActiveBackup(ctx context.Context, backupPoli
 		return true
 	}
 
-	for _, backup := range backups.Items {
-		// TODO: Maybe should have status.Phase to simplify this
-		if !v1helpers.IsConditionTrue(backup.Status.Conditions, string(operatorv1alpha1.BackupCompleted)) && !v1helpers.IsConditionTrue(backup.Status.Conditions, string(operatorv1alpha1.BackupFailed)) {
+	for _, backup := range backupList.Items {
+		if !backuphelpers.IsBackupFinished(&backup) {
 			return true
 		}
 	}
@@ -174,8 +190,52 @@ func (c *BackupPolicyController) hasActiveBackup(ctx context.Context, backupPoli
 	return false
 }
 
+func (c *BackupPolicyController) syncActive(ctx context.Context, backupPolicy *operatorv1alpha1.EtcdBackupPolicy) (*operatorv1alpha1.EtcdBackupPolicy, error) {
+	backups, err := c.backupsLister.List(labels.SelectorFromSet(labels.Set{backuphelpers.LabelEtcdBackupPolicy: backupPolicy.Name}))
+	if err != nil {
+		return backupPolicy, fmt.Errorf("BackupPolicyController failed to list EtcdBackups: %w", err)
+	}
+	backupPolicy = backupPolicy.DeepCopy()
+
+	activeMap := map[types.UID]string{}
+	for _, backup := range backups {
+		if !backuphelpers.IsBackupFinished(backup) {
+			activeMap[backup.UID] = backup.Name
+		}
+	}
+
+	active := backupPolicy.Status.Active[:0]
+	for _, backupRef := range backupPolicy.Status.Active {
+		uid := types.UID(backupRef.UID)
+		if activeMap[uid] == backupRef.Name {
+			delete(activeMap, uid)
+			active = append(active, backupRef)
+		}
+	}
+
+	updateStatus := len(active) != len(backupPolicy.Status.Active) || len(activeMap) > 0
+	for uid, name := range activeMap {
+		klog.Warningf("BackupPolicyController saw unexepected backup that the controller didn't create or it forgot: %s", name)
+		active = append(active, operatorv1alpha1.EtcdBackupReference{Name: name, UID: string(uid)})
+	}
+	backupPolicy.Status.Active = active
+
+	if updateStatus {
+		if backupPolicy, err = c.operatorClient.EtcdBackupPolicies().UpdateStatus(ctx, backupPolicy, v1.UpdateOptions{}); err != nil {
+			return backupPolicy, fmt.Errorf("BackupPolicyController failed to update EtcdBackupPolicy active backups: %w", err)
+		}
+	}
+
+	return backupPolicy, nil
+}
+
 // executeBackup creates EtcdBackup resources for each master node
-func (c *BackupPolicyController) executeBackup(ctx context.Context, backupPolicy *operatorv1alpha1.EtcdBackupPolicy) error {
+func (c *BackupPolicyController) executeBackup(ctx context.Context, backupPolicy *operatorv1alpha1.EtcdBackupPolicy, scheduleTime time.Time) error {
+	// If any backups for this policy are currently active, then we skip this execution
+	if c.hasActiveBackup(ctx, backupPolicy) {
+		return nil
+	}
+
 	// Get master nodes
 	var selector labels.Selector
 	if len(backupPolicy.Spec.NodeSelector) != 0 {
@@ -208,15 +268,15 @@ func (c *BackupPolicyController) executeBackup(ctx context.Context, backupPolicy
 	// Track failed creations
 	failedCreations := []string{}
 
-	now := time.Now()
-	backupNamePrefix := etcdBackupNamePrefix(backupPolicy.Name, now)
-
 	// Create EtcdBackup for each selected master node
+	etcdBackupsClient := c.operatorClient.EtcdBackups()
+	active := make([]operatorv1alpha1.EtcdBackupReference, 0, len(masterNodes))
 	for _, node := range masterNodes {
-		etcdBackupName := names.SimpleNameGenerator.GenerateName(backupNamePrefix)
+		// Deterministic naming to prevent duplicate EtcdBackups from stale informers
+		backupName := generateEtcdBackupName(backupPolicy.Name, node.UID, scheduleTime)
 		etcdBackup := &operatorv1alpha1.EtcdBackup{
 			ObjectMeta: v1.ObjectMeta{
-				Name: etcdBackupName,
+				Name: backupName,
 				Labels: map[string]string{
 					backuphelpers.LabelEtcdBackupPolicy: backupPolicy.Name,
 				},
@@ -230,21 +290,33 @@ func (c *BackupPolicyController) executeBackup(ctx context.Context, backupPolicy
 			},
 		}
 
-		_, err := c.operatorClient.EtcdBackups().Create(ctx, etcdBackup, v1.CreateOptions{})
-		if err != nil {
-			failedCreations = append(failedCreations, node.Name)
-			klog.Warningf("Failed to create EtcdBackup %s for node %s: %v", etcdBackupName, node.Name, err)
-			continue
-		}
+		if backup, err := etcdBackupsClient.Create(ctx, etcdBackup, v1.CreateOptions{}); err != nil {
+			if apierrors.IsAlreadyExists(err) {
+				backup, err = etcdBackupsClient.Get(ctx, backupName, v1.GetOptions{})
+				if err != nil {
+					return fmt.Errorf("BackupPolicyController failed to retrieve duplicate backup %s: %w", backupName, err)
+				}
+				if backup.Labels[backuphelpers.LabelEtcdBackupPolicy] == backupPolicy.Name {
+					active = append(active, operatorv1alpha1.EtcdBackupReference{Name: backup.Name, UID: string(backup.UID)})
+				}
 
-		klog.V(2).Infof("Created EtcdBackup %s for node %s", etcdBackupName, node.Name)
+			} else {
+				failedCreations = append(failedCreations, node.Name)
+				klog.Warningf("Failed to create EtcdBackup %s for node %s: %v", backupName, node.Name, err)
+			}
+		} else {
+			active = append(active, operatorv1alpha1.EtcdBackupReference{Name: backup.Name, UID: string(backup.UID)})
+			klog.V(2).Infof("Created EtcdBackup %s for node %s", backupName, node.Name)
+		}
 	}
 
 	// Update Backup status with last execution time
 	backupPolicy = backupPolicy.DeepCopy()
-	if err := c.updateBackupStatus(ctx, backupPolicy, masterNodes, now); err != nil {
-		klog.Warningf("Failed to update backup status: %v", err)
+	backupPolicy.Status.Active = active
+	backupPolicy.Status.LastScheduleTime = &v1.Time{Time: time.Now()}
+	if _, err := c.operatorClient.EtcdBackupPolicies().UpdateStatus(ctx, backupPolicy, v1.UpdateOptions{}); err != nil {
 		// Don't fail the backup execution if status update fails
+		klog.Warningf("Failed to update backup status: %v", err)
 	}
 
 	if len(failedCreations) > 0 {
@@ -258,20 +330,6 @@ func (c *BackupPolicyController) executeBackup(ctx context.Context, backupPolicy
 	return nil
 }
 
-// updateBackupStatus updates the Backup status with last execution information
-func (c *BackupPolicyController) updateBackupStatus(ctx context.Context, backupPolicy *operatorv1alpha1.EtcdBackupPolicy, nodes []*corev1.Node, scheduleTime time.Time) error {
-	lastScheduleNodes := make([]string, len(nodes))
-	for i, node := range nodes {
-		lastScheduleNodes[i] = node.Name
-	}
-
-	backupPolicy.Status.LastScheduleTime = &v1.Time{Time: scheduleTime}
-	backupPolicy.Status.LastScheduleNodes = lastScheduleNodes
-
-	_, err := c.operatorClient.EtcdBackupPolicies().UpdateStatus(ctx, backupPolicy, v1.UpdateOptions{})
-	return err
-}
-
 func updateControllerDegradedCondition(ctx context.Context, operatorClient v1helpers.OperatorClient, status operatorv1.ConditionStatus, reason string) {
 	_, _, updateErr := v1helpers.UpdateStatus(ctx, operatorClient, v1helpers.UpdateConditionFn(operatorv1.OperatorCondition{
 		Type:   "BackupPolicyControllerDegraded",
@@ -283,12 +341,77 @@ func updateControllerDegradedCondition(ctx context.Context, operatorClient v1hel
 	}
 }
 
-func etcdBackupNamePrefix(backupPolicyName string, now time.Time) string {
-	timestamp := now.Format("20060102-150405")
-	backupNamePrefix := backupPolicyName
-	maxLen := names.MaxGeneratedNameLength - len(timestamp) - 2
-	if len(backupNamePrefix) > maxLen {
-		backupNamePrefix = backupNamePrefix[:maxLen]
+func generateEtcdBackupName(backupPolicyName string, nodeUID types.UID, scheduleTime time.Time) string {
+	// Use a "minute hash" to generate backup names from a policy. Schedules can't fire more
+	// than once per minute, and this ensures backups aren't duplicated.
+	minutesHash := strconv.FormatInt(scheduleTime.Unix()/60, 10)
+
+	uid := strings.ReplaceAll(string(nodeUID), "-", "")
+	maxLen := maxNameLength - len(uid) - len(minutesHash) - 2
+	if len(backupPolicyName) > maxLen {
+		backupPolicyName = backupPolicyName[:maxLen]
 	}
-	return backupNamePrefix + "-" + timestamp + "-"
+	return backupPolicyName + "-" + uid + "-" + minutesHash
+}
+
+func nextScheduleTime(backupPolicy *operatorv1alpha1.EtcdBackupPolicy, now time.Time, schedule cron.Schedule) (*time.Time, error) {
+	_, mostRecentTime, missedSchedules, err := mostRecentScheduleTime(backupPolicy, now, schedule)
+
+	if mostRecentTime == nil || mostRecentTime.After(now) {
+		return nil, err
+	}
+
+	if missedSchedules > 100 {
+		klog.Warningf("BackupPolicyController missed %d backup start times", missedSchedules)
+	}
+	return mostRecentTime, err
+}
+
+func mostRecentScheduleTime(backupPolicy *operatorv1alpha1.EtcdBackupPolicy, now time.Time, schedule cron.Schedule) (time.Time, *time.Time, int64, error) {
+	earliestTime := backupPolicy.CreationTimestamp.Time
+	if backupPolicy.Status.LastScheduleTime != nil {
+		earliestTime = backupPolicy.Status.LastScheduleTime.Time
+	}
+
+	t1 := schedule.Next(earliestTime)
+	t2 := schedule.Next(t1)
+
+	if now.Before(t1) {
+		return earliestTime, nil, 0, nil
+	}
+	if now.Before(t2) {
+		return earliestTime, &t1, 0, nil
+	}
+
+	// It is possible for cron.ParseStandard("59 23 31 2 *") to return an invalid schedule
+	// minute - 59, hour - 23, dom - 31, month - 2, and dow is optional, clearly 31 is invalid
+	// In this case the timeBetweenTwoSchedules will be 0, and we error out the invalid schedule
+	timeBetweenTwoSchedules := int64(t2.Sub(t1).Round(time.Second).Seconds())
+	if timeBetweenTwoSchedules < 1 {
+		return earliestTime, nil, 0, fmt.Errorf("time difference between two schedules is less than 1 second")
+	}
+	// this logic used for calculating number of missed schedules does a rough
+	// approximation, by calculating a diff between two schedules (t1 and t2),
+	// and counting how many of these will fit in between last schedule and now
+	timeElapsed := int64(now.Sub(t1).Seconds())
+	numberOfMissedSchedules := (timeElapsed / timeBetweenTwoSchedules) + 1
+
+	var mostRecentTime time.Time
+	// to get the most recent time accurate for regular schedules and the ones
+	// specified with @every form, we first need to calculate the potential earliest
+	// time by multiplying the initial number of missed schedules by its interval,
+	// this is critical to ensure @every starts at the correct time, this explains
+	// the numberOfMissedSchedules-1, the additional -1 serves there to go back
+	// in time one more time unit, and let the cron library calculate a proper
+	// schedule, for case where the schedule is not consistent, for example
+	// something like  30 6-16/4 * * 1-5
+	potentialEarliest := t1.Add(time.Duration((numberOfMissedSchedules-1-1)*timeBetweenTwoSchedules) * time.Second)
+	for t := schedule.Next(potentialEarliest); !t.After(now); t = schedule.Next(t) {
+		mostRecentTime = t
+	}
+
+	if mostRecentTime.IsZero() {
+		return earliestTime, nil, numberOfMissedSchedules, nil
+	}
+	return earliestTime, &mostRecentTime, numberOfMissedSchedules, nil
 }

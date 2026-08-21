@@ -12,6 +12,7 @@ type EtcdBackupPolicySpecApplyConfiguration struct {
 	TimeZone *string `json:"timeZone,omitempty"`
 	// nodeSelector specifies which master node(s) to run backup jobs on.
 	// If no selector is specified, the default node-role.kubernetes.io/master label will be used.
+	// If no nodes are matched, then no backups will run.
 	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
 	// nodeCount sets the maximum number of nodes to run backups on when multiple are selected.
 	// If a value greater than zero is set, nodes are selected in lexicographical order.
@@ -20,7 +21,7 @@ type EtcdBackupPolicySpecApplyConfiguration struct {
 	// storage specifies the location where etcd backup files will be saved.
 	Storage *EtcdBackupStorageApplyConfiguration `json:"storage,omitempty"`
 	// retentionRules defines the policy for retaining and deleting existing backups.
-	// Backups are deleted from the oldest first until all rules are satisfied (logical OR).
+	// Backups are deleted from the oldest first until all rules are satisfied.
 	// If no rules are specified then backups created by this policy will not be automatically deleted.
 	RetentionRules []EtcdBackupPolicyRetentionRuleApplyConfiguration `json:"retentionRules,omitempty"`
 	// failedBackupsHistoryLimit defined the number of failed etcdbackups to retain. Value must be non-negative integer. Defaults to 1.

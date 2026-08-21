@@ -24,10 +24,10 @@ type testCaseBackupPolicyRetentionController struct {
 
 func runBackupPolicyRetentionControllerTest(t *testing.T, tc testCaseBackupPolicyRetentionController) {
 	t.Helper()
-	objects := make([]runtime.Object, 0, len(tc.backupPolicies)+len(tc.backups))
-	objects = testutils.AppendRuntimeObjects(objects, tc.backupPolicies)
-	objects = testutils.AppendRuntimeObjects(objects, tc.backups)
-	operatorFake := operatorfake.NewClientset(objects...)
+	operatorObjs := make([]runtime.Object, 0, len(tc.backupPolicies)+len(tc.backups))
+	operatorObjs = testutils.AppendRuntimeObjects(operatorObjs, tc.backupPolicies)
+	operatorObjs = testutils.AppendRuntimeObjects(operatorObjs, tc.backups)
+	operatorFake := operatorfake.NewClientset(operatorObjs...)
 
 	operatorSharedFactory := operatorinformers.NewSharedInformerFactory(operatorFake, 0)
 

@@ -70,6 +70,7 @@ spec:
                 description: failedBackupsHistoryLimit defined the number of failed
                   etcdbackups to retain. Value must be non-negative integer. Defaults
                   to 1.
+                minimum: 0
                 type: integer
               nodeCount:
                 description: |-
@@ -84,11 +85,12 @@ spec:
                 description: |-
                   nodeSelector specifies which master node(s) to run backup jobs on.
                   If no selector is specified, the default node-role.kubernetes.io/master label will be used.
+                  If no nodes are matched, then no backups will run.
                 type: object
               retentionRules:
                 description: |-
                   retentionRules defines the policy for retaining and deleting existing backups.
-                  Backups are deleted from the oldest first until all rules are satisfied (logical OR).
+                  Backups are deleted from the oldest first until all rules are satisfied.
                   If no rules are specified then backups created by this policy will not be automatically deleted.
                 items:
                   properties:
@@ -115,6 +117,14 @@ spec:
                   required:
                   - type
                   type: object
+                  x-kubernetes-validations:
+                  - message: maxQuantity is required when type is MaxQuantity, and
+                      forbidden otherwise
+                    rule: '(self.type == ''MaxQuantity'') ? has(self.maxQuantity)
+                      : !has(self.maxQuantity)'
+                  - message: maxSize is required when type is MaxSize, and forbidden
+                      otherwise
+                    rule: '(self.type == ''MaxSize'') ? has(self.maxSize) : !has(self.maxSize)'
                 type: array
               schedule:
                 description: schedule sets the backup schedule in Cron format, see
@@ -186,6 +196,7 @@ spec:
                   If not specified, this will default to the time zone of the cluster-etcd-operator process.
                 type: string
             required:
+            - failedBackupsHistoryLimit
             - schedule
             - storage
             type: object
@@ -193,11 +204,21 @@ spec:
             description: status holds observed values from the cluster. They may not
               be overridden.
             properties:
-              lastScheduleNodes:
-                description: lastScheduleNodes is the name of nodes selected during
-                  the last scheduled execution.
+              active:
+                description: active is a list of references to in progress backups
+                  controlled by this policy
                 items:
-                  type: string
+                  properties:
+                    name:
+                      description: name of the backup
+                      type: string
+                    uid:
+                      description: uid of the backup
+                      type: string
+                  required:
+                  - name
+                  - uid
+                  type: object
                 type: array
               lastScheduleTime:
                 description: |-

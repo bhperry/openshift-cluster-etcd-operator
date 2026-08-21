@@ -39,20 +39,15 @@ type testCaseBackupController struct {
 
 func runBackupControllerTest(t *testing.T, tc testCaseBackupController) {
 	t.Helper()
-	backups := make([]runtime.Object, 0, len(tc.backups))
-	for _, backup := range tc.backups {
-		backups = append(backups, backup)
-	}
+	operatorObjs := make([]runtime.Object, 0, len(tc.backups))
+	operatorObjs = testutils.AppendRuntimeObjects(operatorObjs, tc.backups)
+
 	k8sObjs := make([]runtime.Object, 0, len(tc.jobs)+len(tc.pvcs))
-	for _, job := range tc.jobs {
-		k8sObjs = append(k8sObjs, job)
-	}
-	for _, pvc := range tc.pvcs {
-		k8sObjs = append(k8sObjs, pvc)
-	}
+	k8sObjs = testutils.AppendRuntimeObjects(k8sObjs, tc.jobs)
+	k8sObjs = testutils.AppendRuntimeObjects(k8sObjs, tc.pvcs)
 
 	client := k8sfakeclient.NewSimpleClientset(k8sObjs...)
-	operatorFake := operatorfake.NewSimpleClientset(backups...)
+	operatorFake := operatorfake.NewSimpleClientset(operatorObjs...)
 
 	sharedFactory := informers.NewSharedInformerFactory(client, 0)
 	operatorSharedFactory := operatorinformers.NewSharedInformerFactory(operatorFake, 0)
@@ -101,12 +96,10 @@ func TestSyncLoopHappyPath(t *testing.T) {
 		validate: func(t *testing.T, client *k8sfakeclient.Clientset, operatorFake *operatorfake.Clientset) {
 			job := requireBackupJobCreated(t, client, backup)
 
-			updateAction := requireFind(t, operatorFake.Actions(), func(action k8stesting.Action) bool {
-				_, ok := action.(k8stesting.UpdateActionImpl)
-				return ok
-			}).(k8stesting.UpdateActionImpl)
-			require.Equal(t, "update", updateAction.GetVerb())
-			updatedBackup := updateAction.Object.(*operatorv1alpha1.EtcdBackup)
+			action, ok := testutils.GetAction[k8stesting.UpdateActionImpl](operatorFake.Actions())
+			require.True(t, ok, "Expected update action")
+			require.Equal(t, "update", action.GetVerb())
+			updatedBackup := action.Object.(*operatorv1alpha1.EtcdBackup)
 
 			require.Equal(t, updatedBackup.Status.Job, &operatorv1alpha1.EtcdBackupJobReference{
 				Name:      job.Name,
@@ -138,9 +131,10 @@ func TestJobBackupJobFinished(t *testing.T) {
 	backup := testutils.FakeEtcdBackup("test-backup")
 	job := &batchv1.Job{
 		ObjectMeta: v1.ObjectMeta{
-			Name:      "completed-backup-job",
-			Namespace: operatorclient.TargetNamespace,
-			Labels:    map[string]string{"app": backupAppName, backupNameLabel: "test-backup"},
+			Name:       "completed-backup-job",
+			Namespace:  operatorclient.TargetNamespace,
+			Labels:     map[string]string{"app": backupAppName, backupNameLabel: "test-backup"},
+			Finalizers: []string{backuphelpers.FinalizerEtcdBackup},
 		}, Status: batchv1.JobStatus{Conditions: []batchv1.JobCondition{
 			{
 				Type:   batchv1.JobComplete,
@@ -155,27 +149,6 @@ func TestJobBackupJobFinished(t *testing.T) {
 			requireNoBackupJobCreated(t, client)
 			requireBackupUpdated(t, operatorFake, string(operatorv1alpha1.BackupCompleted), string(batchv1.JobComplete))
 			requireJobUpdated(t, client, "test-backup")
-		},
-	})
-}
-
-func TestJobWithoutBackupRemovesJob(t *testing.T) {
-	// Orphaned backup jobs are deleted
-	runBackupControllerTest(t, testCaseBackupController{
-		jobs: []*batchv1.Job{
-			{ObjectMeta: v1.ObjectMeta{
-				Name:      "completed-backup-job",
-				Namespace: operatorclient.TargetNamespace,
-				Labels:    map[string]string{"app": backupAppName, backupNameLabel: "some-backup"},
-			}, Status: batchv1.JobStatus{Conditions: []batchv1.JobCondition{
-				{
-					Type:   batchv1.JobComplete,
-					Status: corev1.ConditionTrue,
-				},
-			}}}},
-		validate: func(t *testing.T, client *k8sfakeclient.Clientset, operatorFake *operatorfake.Clientset) {
-			requireNoBackupJobCreated(t, client)
-			requireJobDeleted(t, client, "completed-backup-job")
 		},
 	})
 }
@@ -197,10 +170,10 @@ func TestPVCNotFound(t *testing.T) {
 
 func TestIndexJobsByBackupLabelName(t *testing.T) {
 	jobs := []*batchv1.Job{
-		{ObjectMeta: v1.ObjectMeta{Name: "test-1", Labels: map[string]string{backupNameLabel: "test-1"}}},
-		{ObjectMeta: v1.ObjectMeta{Name: "test-2", Labels: map[string]string{backupNameLabel: "test-2"}}},
-		{ObjectMeta: v1.ObjectMeta{Name: "test-3", Labels: map[string]string{backupNameLabel: "test-3"}}},
-		{ObjectMeta: v1.ObjectMeta{Name: "test-4", Labels: map[string]string{"some-other-label": "value"}}},
+		{ObjectMeta: v1.ObjectMeta{Name: "test-1", Labels: map[string]string{backupNameLabel: "test-1"}, Finalizers: []string{backuphelpers.FinalizerEtcdBackup}}},
+		{ObjectMeta: v1.ObjectMeta{Name: "test-2", Labels: map[string]string{backupNameLabel: "test-2"}, Finalizers: []string{backuphelpers.FinalizerEtcdBackup}}},
+		{ObjectMeta: v1.ObjectMeta{Name: "test-3", Labels: map[string]string{backupNameLabel: "test-3"}, Finalizers: []string{backuphelpers.FinalizerEtcdBackup}}},
+		{ObjectMeta: v1.ObjectMeta{Name: "test-4", Labels: map[string]string{"some-other-label": "value"}, Finalizers: []string{backuphelpers.FinalizerEtcdBackup}}},
 	}
 	expected := map[string]*batchv1.Job{}
 	expected["test-1"] = jobs[0]
@@ -274,7 +247,7 @@ func requireBackupJobCreated(t *testing.T, client *k8sfakeclient.Clientset, back
 	require.Equal(t, "create", createAction.GetVerb())
 	createdJob := createAction.Object.(*batchv1.Job)
 
-	require.Truef(t, strings.HasPrefix(createdJob.Name, "backup-"+backup.Name), "expected job.name [%s] to have prefix [%s]", createdJob.Name, "backup-"+backup.Name)
+	require.Truef(t, strings.HasPrefix(createdJob.Name, backup.Name), "expected job.name [%s] to have prefix [%s]", createdJob.Name, backup.Name)
 	require.Equal(t, operatorclient.TargetNamespace, createdJob.Namespace)
 	require.Equal(t, backup.Name, createdJob.Labels[backupNameLabel])
 	require.Equal(t, "operator-pullspec-image", createdJob.Spec.Template.Spec.InitContainers[0].Image)
@@ -317,16 +290,9 @@ func findFirstCreateAction(client *k8sfakeclient.Clientset) *k8stesting.CreateAc
 
 func requireBackupUpdated(t *testing.T, client *operatorfake.Clientset, expectedConditionType string, expectedConditionMessage string) {
 	t.Helper()
-	var updateStatusAction *k8stesting.UpdateActionImpl
-	for _, action := range client.Fake.Actions() {
-		if a, ok := action.(k8stesting.UpdateActionImpl); ok && a.Subresource == "status" {
-			updateStatusAction = &a
-			break
-		}
-	}
-
-	require.NotNilf(t, updateStatusAction, "expected to find at least one status updateAction, but found %v", client.Fake.Actions())
-	b := updateStatusAction.Object.(*operatorv1alpha1.EtcdBackup)
+	action, ok := testutils.GetStatusAction[k8stesting.UpdateActionImpl](client.Fake.Actions())
+	require.Truef(t, ok, "expected to find at least one status updateAction, but found %v", client.Fake.Actions())
+	b := action.Object.(*operatorv1alpha1.EtcdBackup)
 	require.Equal(t, []v1.Condition{
 		{
 			Type:    expectedConditionType,
@@ -339,17 +305,10 @@ func requireBackupUpdated(t *testing.T, client *operatorfake.Clientset, expected
 
 func requireJobUpdated(t *testing.T, client *k8sfakeclient.Clientset, backupName string) {
 	t.Helper()
-	var updateAction *k8stesting.UpdateActionImpl
-	for _, action := range client.Fake.Actions() {
-		if a, ok := action.(k8stesting.UpdateActionImpl); ok {
-			updateAction = &a
-			break
-		}
-	}
-
-	require.NotNilf(t, updateAction, "expected to find at least one updateAction, but found %v", client.Fake.Actions())
-	j := updateAction.Object.(*batchv1.Job)
-	require.Equal(t, map[string]string{"app": "cluster-backup-job", backupNameLabel: backupName, "state": "processed"}, j.Labels)
+	action, ok := testutils.GetStatusAction[k8stesting.UpdateActionImpl](client.Fake.Actions())
+	require.Truef(t, ok, "expected to find at least one status updateAction, but found %v", client.Fake.Actions())
+	j := action.Object.(*batchv1.Job)
+	require.Equal(t, map[string]string{"app": "cluster-backup-job", backupNameLabel: backupName}, j.Labels)
 }
 
 func requireJobDeleted(t *testing.T, client *k8sfakeclient.Clientset, jobName string) {

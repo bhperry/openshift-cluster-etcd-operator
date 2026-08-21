@@ -54,7 +54,7 @@ type EtcdBackupSpec struct {
 // +kubebuilder:validation:XValidation:rule="self.type == 'Local' ? has(self.local) : !has(self.local)",message="local is required when type is Local, and forbidden otherwise"
 // +union
 type EtcdBackupStorage struct {
-	// +kubebuilder:validation:Enum:=PVC;Local;
+	// +kubebuilder:validation:Enum=PVC;Local
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="type is immutable once set"
 	// +required

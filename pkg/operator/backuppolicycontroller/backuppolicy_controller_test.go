@@ -114,7 +114,7 @@ func TestBackupPolicyCreateBackup(t *testing.T) {
 			backupPolicy, err := operatorFake.OperatorV1alpha1().EtcdBackupPolicies().Get(context.TODO(), "test-backup-policy", v1.GetOptions{})
 			require.NoError(t, err)
 			require.NotNil(t, backupPolicy.Status.LastScheduleTime)
-			require.Equal(t, backupPolicy.Status.LastScheduleNodes, []string{"test-node"})
+			require.Len(t, backupPolicy.Status.Active, 1)
 		},
 	})
 }
@@ -149,7 +149,7 @@ func TestBackupPolicyCreateMultipleBackupsWithSelector(t *testing.T) {
 			backupPolicy, err := operatorFake.OperatorV1alpha1().EtcdBackupPolicies().Get(context.TODO(), "test-backup-policy", v1.GetOptions{})
 			require.NoError(t, err)
 			require.NotNil(t, backupPolicy.Status.LastScheduleTime)
-			require.ElementsMatch(t, backupPolicy.Status.LastScheduleNodes, expectedNodes)
+			require.Len(t, backupPolicy.Status.Active, len(expectedNodes))
 		},
 	})
 }
@@ -160,17 +160,79 @@ func TestBackupPolicyBackupExists(t *testing.T) {
 			testutils.FakeEtcdBackupPolicy("test-backup-policy", "@daily", testutils.WithBackupPolicyAge(25*time.Hour))},
 		backups: []*operatorv1alpha1.EtcdBackup{testutils.FakeEtcdBackup("test-backup", testutils.WithBackupPolicy("test-backup-policy"))},
 		validate: func(t *testing.T, client *k8sfakeclient.Clientset, operatorFake *operatorfake.Clientset) {
-			// No new etcdbackup was created
-			for _, action := range operatorFake.Actions() {
-				if _, ok := action.(k8stesting.CreateAction); ok {
-					require.Fail(t, "Did not expect to find a new create action")
-				}
-			}
-
+			requireCreatedBackups(t, operatorFake, 0)
 			backups, err := operatorFake.OperatorV1alpha1().EtcdBackups().List(context.TODO(), v1.ListOptions{})
 			require.NoError(t, err)
 			require.Len(t, backups.Items, 1)
 			require.Equal(t, backups.Items[0].Name, "test-backup")
+		},
+	})
+}
+
+func TestBackupPolicyActiveBackups(t *testing.T) {
+	runBackupPolicyControllerTest(t, testCaseBackupPolicyController{
+		backupPolicies: []*operatorv1alpha1.EtcdBackupPolicy{
+			testutils.FakeEtcdBackupPolicy("test-backup-policy", "@hourly", testutils.WithBackupPolicyStatus(operatorv1alpha1.EtcdBackupPolicyStatus{
+				LastScheduleTime: &v1.Time{Time: time.Now().Add(-2 * time.Hour)},
+				Active: []operatorv1alpha1.EtcdBackupReference{
+					{Name: "test-backup-completed", UID: "test-backup-completed-uid"},
+					{Name: "test-backup-failed", UID: "test-backup-failed-uid"},
+					{Name: "test-backup-deleted", UID: "test-backup-deleted-uid"},
+					{Name: "test-backup-pending", UID: "test-backup-pending-uid"},
+				},
+			}))},
+		backups: []*operatorv1alpha1.EtcdBackup{
+			testutils.FakeEtcdBackup("test-backup-completed", testutils.WithBackupPolicy("test-backup-policy"), testutils.WithBackupCompleted()),
+			testutils.FakeEtcdBackup("test-backup-failed", testutils.WithBackupPolicy("test-backup-policy"), testutils.WithBackupFailed()),
+			testutils.FakeEtcdBackup("test-backup-pending", testutils.WithBackupPolicy("test-backup-policy")),
+		},
+		nodes: []*corev1.Node{testutils.FakeNode("test-node", testutils.WithMasterLabel())},
+		validate: func(t *testing.T, client *k8sfakeclient.Clientset, operatorFake *operatorfake.Clientset) {
+			backupPolicy, err := operatorFake.OperatorV1alpha1().EtcdBackupPolicies().Get(t.Context(), "test-backup-policy", v1.GetOptions{})
+			require.NoError(t, err)
+			require.ElementsMatch(t, []operatorv1alpha1.EtcdBackupReference{{Name: "test-backup-pending", UID: "test-backup-pending-uid"}}, backupPolicy.Status.Active)
+			requireCreatedBackups(t, operatorFake, 0)
+		},
+	})
+}
+
+func TestBackupPolicyActiveBackupsAllFinished(t *testing.T) {
+	runBackupPolicyControllerTest(t, testCaseBackupPolicyController{
+		backupPolicies: []*operatorv1alpha1.EtcdBackupPolicy{
+			testutils.FakeEtcdBackupPolicy("test-backup-policy", "@hourly", testutils.WithBackupPolicyStatus(operatorv1alpha1.EtcdBackupPolicyStatus{
+				LastScheduleTime: &v1.Time{Time: time.Now().Add(-2 * time.Hour)},
+				Active: []operatorv1alpha1.EtcdBackupReference{
+					{Name: "test-backup-completed", UID: "test-backup-completed-uid"},
+					{Name: "test-backup-failed", UID: "test-backup-failed-uid"},
+				},
+			}))},
+		backups: []*operatorv1alpha1.EtcdBackup{
+			testutils.FakeEtcdBackup("test-backup-completed", testutils.WithBackupPolicy("test-backup-policy"), testutils.WithBackupCompleted()),
+			testutils.FakeEtcdBackup("test-backup-failed", testutils.WithBackupPolicy("test-backup-policy"), testutils.WithBackupFailed()),
+		},
+		nodes: []*corev1.Node{testutils.FakeNode("test-node", testutils.WithMasterLabel())},
+		validate: func(t *testing.T, client *k8sfakeclient.Clientset, operatorFake *operatorfake.Clientset) {
+			backupPolicy, err := operatorFake.OperatorV1alpha1().EtcdBackupPolicies().Get(t.Context(), "test-backup-policy", v1.GetOptions{})
+			require.NoError(t, err)
+			require.Len(t, backupPolicy.Status.Active, 1)
+			backups := requireCreatedBackups(t, operatorFake, 1)
+			require.Equal(t, operatorv1alpha1.EtcdBackupReference{Name: backups[0].Name, UID: string(backups[0].UID)}, backupPolicy.Status.Active[0])
+		},
+	})
+}
+
+func TestBackupPolicyMissedBackupSchedules(t *testing.T) {
+	runBackupPolicyControllerTest(t, testCaseBackupPolicyController{
+		backupPolicies: []*operatorv1alpha1.EtcdBackupPolicy{
+			testutils.FakeEtcdBackupPolicy("test-backup-policy", "@hourly", testutils.WithBackupPolicyAge(25*time.Hour), testutils.WithBackupPolicyStatus(operatorv1alpha1.EtcdBackupPolicyStatus{
+				LastScheduleTime: &v1.Time{Time: time.Now().Add(-4 * time.Hour)},
+			}))},
+		nodes: []*corev1.Node{testutils.FakeNode("test-node", testutils.WithMasterLabel())},
+		validate: func(t *testing.T, client *k8sfakeclient.Clientset, operatorFake *operatorfake.Clientset) {
+			requireCreatedBackups(t, operatorFake, 1)
+			backups, err := operatorFake.OperatorV1alpha1().EtcdBackups().List(context.TODO(), v1.ListOptions{})
+			require.NoError(t, err)
+			require.Len(t, backups.Items, 1)
 		},
 	})
 }
@@ -180,13 +242,7 @@ func TestBackupPolicyIgnoreDeleted(t *testing.T) {
 		backupPolicies: []*operatorv1alpha1.EtcdBackupPolicy{
 			testutils.FakeEtcdBackupPolicy("test-backup-policy", "@daily", testutils.WithBackupPolicyAge(25*time.Hour), testutils.WithBackupPolicyDeleted())},
 		validate: func(t *testing.T, client *k8sfakeclient.Clientset, operatorFake *operatorfake.Clientset) {
-			// No etcdbackup was created
-			for _, action := range operatorFake.Actions() {
-				if _, ok := action.(k8stesting.CreateAction); ok {
-					require.Fail(t, "Did not expect to find a new create action")
-				}
-			}
-
+			requireCreatedBackups(t, operatorFake, 0)
 			backups, err := operatorFake.OperatorV1alpha1().EtcdBackups().List(context.TODO(), v1.ListOptions{})
 			require.NoError(t, err)
 			require.Len(t, backups.Items, 0)
@@ -243,4 +299,39 @@ func TestBackupPolicyScheduleParsing(t *testing.T) {
 			runBackupPolicyControllerTest(t, tc)
 		})
 	}
+}
+
+func TestNextScheduleTime(t *testing.T) {
+	now := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+	backupPolicy := testutils.FakeEtcdBackupPolicy("test-backup-policy", "@hourly", testutils.WithBackupPolicyStatus(operatorv1alpha1.EtcdBackupPolicyStatus{
+		LastScheduleTime: &v1.Time{Time: now.Add(-4 * time.Hour)},
+	}))
+	schedule, err := cron.NewParser(cron.Descriptor).Parse(backupPolicy.Spec.Schedule)
+	require.NoError(t, err)
+
+	nextSchedule, err := nextScheduleTime(backupPolicy, now, schedule)
+	require.NoError(t, err)
+	require.NotNil(t, nextSchedule)
+
+	require.WithinDuration(t, now, *nextSchedule, time.Minute)
+}
+
+func requireCreatedBackups(t *testing.T, operatorFake *operatorfake.Clientset, count int) []*operatorv1alpha1.EtcdBackup {
+	t.Helper()
+	createdBackups := getCreatedBackups(t, operatorFake)
+	require.Len(t, createdBackups, count)
+	return createdBackups
+}
+
+func getCreatedBackups(t *testing.T, operatorFake *operatorfake.Clientset) []*operatorv1alpha1.EtcdBackup {
+	t.Helper()
+	var createdBackups []*operatorv1alpha1.EtcdBackup
+	for _, action := range operatorFake.Actions() {
+		if action, ok := action.(k8stesting.CreateAction); ok {
+			if backup, ok := action.GetObject().(*operatorv1alpha1.EtcdBackup); ok {
+				createdBackups = append(createdBackups, backup)
+			}
+		}
+	}
+	return createdBackups
 }
