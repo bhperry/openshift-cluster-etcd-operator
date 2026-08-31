@@ -196,7 +196,6 @@ spec:
                   If not specified, this will default to the time zone of the cluster-etcd-operator process.
                 type: string
             required:
-            - failedBackupsHistoryLimit
             - schedule
             - storage
             type: object

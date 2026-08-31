@@ -521,6 +521,16 @@ func RunOperator(ctx context.Context, controllerContext *controllercmd.Controlle
 			jobsInformer.Informer(),
 			podsInformer.Informer())
 
+		backupQueueController := backupcontroller.NewBackupQueueController(
+			AlivenessChecker,
+			backupsLister,
+			controlPlaneNodeLister,
+			operatorConfigClientv1Alpha1,
+			controllerContext.EventRecorder,
+			featureGateAccessor,
+			etcdBackupInformer.Informer(),
+			controlPlaneNodeInformer)
+
 		backupPolicyController := backuppolicycontroller.NewBackupPolicyController(
 			AlivenessChecker,
 			backupsLister,
@@ -566,6 +576,7 @@ func RunOperator(ctx context.Context, controllerContext *controllercmd.Controlle
 		go etcdBackupPoliciesInformer.Informer().Run(ctx.Done())
 
 		go backupController.Run(ctx, 1)
+		go backupQueueController.Run(ctx, 1)
 		go backupPolicyController.Run(ctx, 1)
 		go backupPolicyRetentionController.Run(ctx, 1)
 		go backupGarbageCollectionController.Run(ctx, 1)

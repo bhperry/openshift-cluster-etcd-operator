@@ -436,6 +436,16 @@ func WithBackupStatus(status operatorv1alpha1.EtcdBackupStatus) func(backup *ope
 	}
 }
 
+func WithBackupPending(nodeName string) func(backup *operatorv1alpha1.EtcdBackup) {
+	return func(backup *operatorv1alpha1.EtcdBackup) {
+		backup.Status.NodeName = nodeName
+		backup.Status.Conditions = append(backup.Status.Conditions, v1.Condition{
+			Type:   string(operatorv1alpha1.BackupPending),
+			Status: v1.ConditionTrue,
+		})
+	}
+}
+
 func WithBackupCompleted() func(backup *operatorv1alpha1.EtcdBackup) {
 	return func(backup *operatorv1alpha1.EtcdBackup) {
 		backup.Status.Conditions = append(backup.Status.Conditions, v1.Condition{
@@ -478,7 +488,11 @@ func WithBackupFailed() func(backup *operatorv1alpha1.EtcdBackup) {
 			backup.Status.Files = nil
 		}
 		if backup.Status.NodeName == "" {
-			backup.Status.NodeName = "test-node"
+			if backup.Spec.NodeName == "" {
+				backup.Status.NodeName = "test-node"
+			} else {
+				backup.Status.NodeName = backup.Spec.NodeName
+			}
 		}
 	}
 }

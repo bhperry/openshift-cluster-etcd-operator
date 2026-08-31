@@ -240,25 +240,15 @@ func (c *BackupPolicyController) executeBackup(ctx context.Context, backupPolicy
 	var selector labels.Selector
 	if len(backupPolicy.Spec.NodeSelector) != 0 {
 		selector = labels.SelectorFromSet(backupPolicy.Spec.NodeSelector)
-	} else {
-		var err error
-		selector, err = labels.Parse("node-role.kubernetes.io/master")
-		if err != nil {
-			return err
-		}
 	}
-
-	masterNodes, err := c.nodeLister.List(selector)
+	masterNodes, err := backuphelpers.SelectBackupNodes(c.nodeLister, selector)
 	if err != nil {
-		c.eventRecorder.Warningf("BackupExecutionFailed",
-			"Failed to get master nodes for backup %s, will retry on next sync: %v",
-			backupPolicy.Name, err)
-		return err
+		return fmt.Errorf("BackupPolicyController failed to select master nodes for backup: %w", err)
 	}
-
 	if len(masterNodes) == 0 {
 		c.eventRecorder.Warningf("BackupExecutionSkipped",
 			"No master nodes found for backup %s, skipping this execution", backupPolicy.Name)
+		// TODO: Retry backoff?
 		return nil
 	}
 	if backupPolicy.Spec.NodeCount > 0 && backupPolicy.Spec.NodeCount <= len(masterNodes) {

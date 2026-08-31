@@ -78,6 +78,8 @@ type EtcdBackupPolicySpec struct {
 	// failedBackupsHistoryLimit defined the number of failed etcdbackups to retain. Value must be non-negative integer. Defaults to 1.
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Default=1
+	// +kubebuilder:validation:Optional
+	// +optional
 	FailedBackupsHistoryLimit int `json:"failedBackupsHistoryLimit"`
 }
 

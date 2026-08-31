@@ -91,7 +91,7 @@ func NewBackupController(
 		ResyncEvery(1*time.Minute).
 		WithFilteredEventsInformers(func(obj interface{}) bool {
 			if backup, ok := obj.(*operatorv1alpha1.EtcdBackup); ok {
-				return !backuphelpers.IsBackupFinished(backup)
+				return backuphelpers.IsBackupPending(backup)
 			}
 			if job, ok := obj.(*batchv1.Job); ok {
 				// Only trigger sync on backup jobs when they have finalizer and are completed or failed
@@ -140,7 +140,7 @@ func (c *BackupController) sync(ctx context.Context, _ factory.SyncContext) erro
 			continue
 		}
 
-		if backup.DeletionTimestamp == nil && backup.Status.Job == nil {
+		if backup.DeletionTimestamp == nil && backup.Status.Job == nil && backuphelpers.IsBackupPending(backup) {
 			backupsToRun = append(backupsToRun, backup)
 		}
 	}
@@ -294,7 +294,6 @@ func reconcileJobStatus(ctx context.Context,
 			// TODO(bhperry): If pod is not found, backup will be marked completed but won't have status.files info.
 			// 		In this case we can still GC, it just won't count towards total size with MaxSize rule.
 			//		Backup directory can be inferred based on backup name and storage path.
-			// 		Node should be selected BEFORE running job to ensure this is possible (should do this anyway to pick a healthy etcd member)
 			if pod, err := findCompletedBackupPod(podLister, job.Name); err != nil {
 				return fmt.Errorf("error listing pods for backup job [%s]: %w", job.Name, err)
 			} else if pod != nil {
@@ -307,7 +306,6 @@ func reconcileJobStatus(ctx context.Context,
 				} else {
 					backup.Status.Files = files
 				}
-				backup.Status.NodeName = pod.Spec.NodeName
 			}
 		}
 
@@ -372,13 +370,8 @@ func createBackupJob(ctx context.Context,
 	job.Spec.Template.Spec.InitContainers[0].Image = operatorImagePullSpec
 	job.Spec.Template.Spec.Containers[0].Image = operatorImagePullSpec
 
-	// If EtcdBackup specifies a target node, use nodeName instead of nodeSelector
-	if backup.Spec.NodeName != "" {
-		job.Spec.Template.Spec.NodeName = backup.Spec.NodeName
-		// Remove nodeSelector to avoid conflicts
-		delete(job.Spec.Template.Spec.NodeSelector, "node-role.kubernetes.io/master")
-		klog.V(4).Infof("BackupController assigned job [%s] to node [%s]", job.Name, backup.Spec.NodeName)
-	}
+	job.Spec.Template.Spec.NodeName = backup.Status.NodeName
+	klog.V(4).Infof("BackupController assigned job [%s] to node [%s]", job.Name, backup.Status.NodeName)
 
 	backupDir := backupPathMount
 	volume := corev1.Volume{Name: "etc-kubernetes-cluster-backup"}
@@ -424,20 +417,10 @@ func createBackupJob(ctx context.Context,
 	}
 
 	backup = backup.DeepCopy()
-	backup.Status = operatorv1alpha1.EtcdBackupStatus{
-		NodeName: backup.Spec.NodeName,
-		Conditions: []metav1.Condition{{
-			Type:               string(operatorv1alpha1.BackupPending),
-			Reason:             string(operatorv1alpha1.BackupPending),
-			Message:            "Backup job created",
-			Status:             v1.ConditionTrue,
-			LastTransitionTime: metav1.NewTime(time.Now()),
-		}},
-		Job: &operatorv1alpha1.EtcdBackupJobReference{
-			Name:      job.Name,
-			Namespace: job.Namespace,
-			UID:       string(job.UID),
-		},
+	backup.Status.Job = &operatorv1alpha1.EtcdBackupJobReference{
+		Name:      job.Name,
+		Namespace: job.Namespace,
+		UID:       string(job.UID),
 	}
 
 	_, err = backupClient.UpdateStatus(ctx, backup, v1.UpdateOptions{})
@@ -489,7 +472,7 @@ func generateBackupJobName(backup *operatorv1alpha1.EtcdBackup) string {
 	var suffix string
 	switch backup.Spec.Storage.Type {
 	case operatorv1alpha1.EtcdBackupStorageTypeLocal:
-		suffix = "-" + shortHash(string(backup.Spec.Storage.Type), backup.Spec.NodeName)
+		suffix = "-" + shortHash(string(backup.Spec.Storage.Type), backup.Status.NodeName)
 	case operatorv1alpha1.EtcdBackupStorageTypePVC:
 		suffix = "-" + shortHash(string(backup.Spec.Storage.Type), backup.Spec.Storage.PVC.Name)
 	default:

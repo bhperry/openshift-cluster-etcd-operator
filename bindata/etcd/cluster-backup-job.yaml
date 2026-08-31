@@ -61,8 +61,6 @@ spec:
               name: etcd-ca
       priorityClassName: system-node-critical
       activeDeadlineSeconds: 900
-      nodeSelector:
-        node-role.kubernetes.io/master: ""
       restartPolicy: Never
       hostNetwork: true
       tolerations:
